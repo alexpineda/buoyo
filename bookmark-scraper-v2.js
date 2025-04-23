@@ -8,6 +8,49 @@
  *  - REMOVED image/video download; we just keep the remote URLs
  */
 
+/* -- Intercept video.twimg.com requests -------------------------- */
+const mediaMap = new Map(); // tweetId → [videoUrls]
+
+function stash(url) {
+  // Extract mediaId (e.g., 1914384980051984384) from URLs like:
+  // https://video.twimg.com/ext_tw_video/1914384980051984384/pu/vid/720x1280/4WlPTU0xS7t.mp4
+  // https://video.twimg.com/ext_tw_video/1914384980051984384/pu/pl/manifest.m3u8
+  const idMatch = url.match(/ext_tw_video\/(\d+)\//);
+  if (!idMatch) return;
+  const mediaId = idMatch[1];
+  // Store potentially multiple URLs (e.g., mp4, m3u8) for the same mediaId
+  mediaMap.set(mediaId, [...(mediaMap.get(mediaId) || []), url]);
+  console.log(`Stashed video URL for mediaId ${mediaId}: ${url}`); // Log stashing
+}
+
+/* monkey-patch fetch */
+const _fetch = window.fetch;
+window.fetch = async (...args) => {
+  if (typeof args[0] === "string" && args[0].includes("video.twimg.com")) {
+    stash(args[0]);
+  }
+  return _fetch(...args);
+};
+
+/* monkey-patch XHR */
+const _open = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+  // Check both string and URL object types for the url parameter
+  let urlString = "";
+  if (typeof url === "string") {
+    urlString = url;
+  } else if (url && typeof url.toString === "function") {
+    urlString = url.toString();
+  }
+
+  if (urlString.includes("video.twimg.com")) {
+    stash(urlString);
+  }
+  // Use apply to pass arguments correctly
+  return _open.apply(this, [method, url, ...rest]);
+};
+/* ----------------------------------------------------------------- */
+
 class TweetScraper {
   constructor(options = {}) {
     // Options
@@ -142,8 +185,6 @@ class TweetScraper {
       const tweetData = this.extractTweetData(el, tweetId);
       if (!tweetData) continue;
 
-      this.enrichWithVideoFromAPI(tweetData);
-
       this.processedTweetIds.add(tweetId);
       this.tweets.push(tweetData);
       this.updateHud();
@@ -171,36 +212,63 @@ class TweetScraper {
     const timeISO = timeEl.getAttribute("datetime");
     const tweetText = el.querySelector('[data-testid="tweetText"]')?.innerText;
 
+    const interaction = this.extractInteractionData(el);
+    // Get images, direct videos (rarely populated now), and thumbnails
+    const { images, videos: directVideos, thumbnails } = this.extractMedia(el);
+
+    // Start with directly found video URLs (if any)
+    let finalVideoUrls = new Set(directVideos);
+
+    // Try to find richer video URLs using thumbnails and the mediaMap
+    for (const thumbUrl of thumbnails) {
+      // Extract mediaId from thumbnail URL, e.g.:
+      // https://pbs.twimg.com/ext_tw_video_thumb/1914384980051984384/pu/img/randomstuff.jpg
+      const mediaIdMatch = thumbUrl.match(/ext_tw_video_thumb\/(\d+)\//);
+      if (mediaIdMatch && mediaIdMatch[1]) {
+        const mediaId = mediaIdMatch[1];
+        const capturedUrls = mediaMap.get(mediaId) || [];
+        if (capturedUrls.length > 0) {
+          console.log(
+            `Found ${capturedUrls.length} captured URLs for mediaId ${mediaId} via thumb ${thumbUrl}`
+          );
+          capturedUrls.forEach((url) => finalVideoUrls.add(url));
+        }
+      }
+    }
+
     // Attempt to find the specific link structure for the post URL
     const postLinks = el.querySelectorAll('a[href*="/status/"]');
     let postUrl = "";
     // Find the link whose href ends with the tweetId
     for (const link of postLinks) {
-      if (link.href.endsWith(tweetId)) {
+      if (link.href.endsWith(`/${tweetId}`)) {
+        // Ensure it's the full ID match at the end
         postUrl = link.href;
         break;
       }
     }
     // Fallback if the specific structure isn't found (less reliable)
     if (!postUrl) {
-      const genericLink = el.querySelector(
-        ".css-175oi2r.r-18u37iz.r-1q142lx a"
-      );
-      postUrl = genericLink?.href || "";
+      // Try finding the link associated with the timestamp
+      const timeLink = el.querySelector("time")?.closest("a");
+      if (timeLink && timeLink.href.includes(`/status/${tweetId}`)) {
+        postUrl = timeLink.href;
+      } else {
+        // Last resort (may grab profile links etc)
+        const genericLink = el.querySelector('a[href*="/status/"]');
+        postUrl = genericLink?.href || "";
+      }
     }
-
-    const interaction = this.extractInteractionData(el);
-    const { images, videos } = this.extractMedia(el);
 
     return {
       tweetId,
       authorName,
       tweetText,
       timeISO,
-      postUrl,
+      postUrl, // Updated postUrl logic
       interaction,
       images,
-      videos,
+      videos: [...finalVideoUrls], // Convert Set back to Array
     };
   }
 
@@ -215,22 +283,45 @@ class TweetScraper {
       '[data-testid="tweetPhoto"][style*="background-image"]'
     );
 
-    const imgs = [...imgNodes].map((n) => n.src);
+    const imageSources = new Set();
+    const thumbnailSources = new Set();
 
-    const bgImgs = [...bgNodes]
-      .map((n) => {
-        const m = n.style.backgroundImage.match(/url\\("?(.*?)"?\\)/); // Escaped quotes
-        return m ? m[1] : null;
-      })
-      .filter(Boolean);
+    // Process img nodes
+    imgNodes.forEach((n) => {
+      if (n.src) {
+        if (n.src.includes("ext_tw_video_thumb")) {
+          thumbnailSources.add(n.src);
+        } else if (n.src.includes("pbs.twimg.com/media")) {
+          imageSources.add(n.src);
+        }
+        // Add other potential image sources if needed
+      }
+    });
 
-    // Ensure video sources are directly within a video tag
-    const videos = [...root.querySelectorAll("video > source[src]")].map(
-      (v) => v.src
+    // Process background-image nodes
+    bgNodes.forEach((n) => {
+      const match = n.style.backgroundImage.match(/url\("?(.+?)"?\)/);
+      const url = match ? match[1] : null;
+      if (url) {
+        if (url.includes("ext_tw_video_thumb")) {
+          thumbnailSources.add(url);
+        } else if (url.includes("pbs.twimg.com/media")) {
+          imageSources.add(url);
+        }
+        // Add other potential image sources if needed
+      }
+    });
+
+    // Ensure video sources are directly within a video tag (less common now)
+    const directVideoSources = new Set(
+      [...root.querySelectorAll("video > source[src]")].map((v) => v.src)
     );
 
-    // Combine and deduplicate image URLs
-    return { images: [...new Set([...imgs, ...bgImgs])], videos };
+    return {
+      images: [...imageSources],
+      videos: [...directVideoSources],
+      thumbnails: [...thumbnailSources],
+    };
   }
 
   // Parse interactions (replies, reposts, likes, bookmarks, views)
