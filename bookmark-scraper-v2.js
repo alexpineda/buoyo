@@ -63,16 +63,16 @@ class TweetScraper {
   initObserver() {
     this.observer = new MutationObserver((mutations) => {
       for (let mutation of mutations) {
+        // Any media block injected? → touch its ancestor <article> again
         if (mutation.addedNodes.length > 0) {
-          // Skip auto-download placeholders
-          const hasDownloadLinks = [...mutation.addedNodes].some(
-            (node) =>
-              node.nodeType === Node.ELEMENT_NODE &&
-              node.hasAttribute("data-automated-download")
-          );
-          if (!hasDownloadLinks) {
-            this.updateTweets();
-          }
+          mutation.addedNodes.forEach((n) => {
+            // Ensure node is an element before calling closest
+            if (n.nodeType === Node.ELEMENT_NODE) {
+              const art = n.closest?.('article[data-testid="tweet"]');
+              // Pass as an array
+              if (art) this.updateTweets([art]);
+            }
+          });
         }
       }
     });
@@ -108,14 +108,28 @@ class TweetScraper {
   }
 
   // Traverse the DOM for tweet elements
-  updateTweets() {
-    const tweetEls = document.querySelectorAll('article[data-testid="tweet"]');
+  updateTweets(seedEls = null) {
+    // Use seedEls if provided, otherwise query the whole document
+    const tweetEls =
+      seedEls || document.querySelectorAll('article[data-testid="tweet"]');
     for (const el of tweetEls) {
       const tweetId = this.extractTweetId(el);
       if (!tweetId) continue;
 
-      // If we've already processed or skipped this tweetId, ignore
-      if (this.processedTweetIds.has(tweetId)) continue;
+      // If we've already processed this tweetId...
+      if (this.processedTweetIds.has(tweetId)) {
+        // Check if it's because media arrived late (seedEls implies this)
+        // and if we already have the tweet text data stored.
+        const already = this.tweets.find((t) => t.tweetId === tweetId);
+        if (seedEls && already) {
+          const { images, videos } = this.extractMedia(el);
+          // Only update if new media was actually found
+          if (images.length && !already.images.length) already.images = images;
+          if (videos.length && !already.videos.length) already.videos = videos;
+        }
+        // Skip further processing for already handled tweets
+        continue;
+      }
 
       // If we see our stopAtTweetId, end the entire process
       if (tweetId === this.stopAtTweetId) {
@@ -127,6 +141,8 @@ class TweetScraper {
       // Extract tweet info
       const tweetData = this.extractTweetData(el, tweetId);
       if (!tweetData) continue;
+
+      this.enrichWithVideoFromAPI(tweetData);
 
       this.processedTweetIds.add(tweetId);
       this.tweets.push(tweetData);
@@ -155,18 +171,26 @@ class TweetScraper {
     const timeISO = timeEl.getAttribute("datetime");
     const tweetText = el.querySelector('[data-testid="tweetText"]')?.innerText;
 
-    const postLink = el.querySelector(".css-175oi2r.r-18u37iz.r-1q142lx a");
-    const postUrl = postLink?.href || "";
+    // Attempt to find the specific link structure for the post URL
+    const postLinks = el.querySelectorAll('a[href*="/status/"]');
+    let postUrl = "";
+    // Find the link whose href ends with the tweetId
+    for (const link of postLinks) {
+      if (link.href.endsWith(tweetId)) {
+        postUrl = link.href;
+        break;
+      }
+    }
+    // Fallback if the specific structure isn't found (less reliable)
+    if (!postUrl) {
+      const genericLink = el.querySelector(
+        ".css-175oi2r.r-18u37iz.r-1q142lx a"
+      );
+      postUrl = genericLink?.href || "";
+    }
 
     const interaction = this.extractInteractionData(el);
-
-    const imageEls = el.querySelectorAll("img");
-    const images = [...imageEls]
-      .map((img) => img.src)
-      .filter((src) => !src.includes("profile_images"));
-
-    const videoEls = el.querySelectorAll("video > source");
-    const videos = [...videoEls].map((v) => v.src);
+    const { images, videos } = this.extractMedia(el);
 
     return {
       tweetId,
@@ -178,6 +202,35 @@ class TweetScraper {
       images,
       videos,
     };
+  }
+
+  // Robust media extractor
+  extractMedia(root) {
+    // imgs with real media urls (within links usually)
+    const imgNodes = root.querySelectorAll(
+      'a[href*="/photo/"] img[src], [data-testid="tweetPhoto"] img[src]'
+    );
+    // divs that use background-image (rare but happens in lists)
+    const bgNodes = root.querySelectorAll(
+      '[data-testid="tweetPhoto"][style*="background-image"]'
+    );
+
+    const imgs = [...imgNodes].map((n) => n.src);
+
+    const bgImgs = [...bgNodes]
+      .map((n) => {
+        const m = n.style.backgroundImage.match(/url\\("?(.*?)"?\\)/); // Escaped quotes
+        return m ? m[1] : null;
+      })
+      .filter(Boolean);
+
+    // Ensure video sources are directly within a video tag
+    const videos = [...root.querySelectorAll("video > source[src]")].map(
+      (v) => v.src
+    );
+
+    // Combine and deduplicate image URLs
+    return { images: [...new Set([...imgs, ...bgImgs])], videos };
   }
 
   // Parse interactions (replies, reposts, likes, bookmarks, views)
